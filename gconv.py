@@ -141,3 +141,17 @@ class SteerableFirstLayer(nn.Module):
         wG = wB.reshape(B * OC, IC, 1, kW)             # [B*OC,IC,1,kW]
         yG = F.conv2d(xG, wG, bias=None, stride=1, padding=(0, kW // 2), groups=B)
         return yG.view(B, OC, 1, L)
+
+
+class PlainFirstLayer(nn.Module):
+    """最简单的第一层：不做任何核转向，仅使用基础卷积。"""
+
+    def __init__(self, in_ch=2, out_ch=32, k=5, fs=50e6):
+        super().__init__()
+        self.base = nn.Conv2d(in_ch, out_ch, kernel_size=(1, k),
+                              padding=(0, k // 2), bias=False)
+        nn.init.kaiming_uniform_(self.base.weight, a=0.2, nonlinearity='relu')
+
+    def forward(self, x, z=None, s=None):
+        assert x.dim() == 4 and x.size(1) == 2, "x应为[B,2,1,L]"
+        return self.base(x)
