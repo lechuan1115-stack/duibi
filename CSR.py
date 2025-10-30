@@ -4,7 +4,7 @@
 """
 CSR: 单模型训练脚本（PerturbAwareNet）
 - 读取：mydata_read.load_adsb_aug5_strict（严格适配你的 .mat 字段/形状）
-- 模型：mymodel1.create('perturbawarenet', num_classes, fs)
+- 模型：mymodel1.create(cfg.model_name, num_classes, fs)
 - 训练：联合训练（分类 + 扰动分类 z + 扰动参数回归 s）
 - 验证/测试：可选是否使用 GT 的 z/s；否则用模型预测的 z^/s^
 - 可视化：训练/验证曲线、混淆矩阵、分类报告、结果CSV/JSON
@@ -59,15 +59,51 @@ def _mixup(x, y, alpha=0.2):
 
 
 @torch.no_grad()
+def _model_supports_perturb_heads(model):
+    """检查模型是否实现了扰动辅助分支需要的属性。"""
+    required_attrs = ["_x_as_32ch", "_perturb_reducer", "z_head", "s_head"]
+    return all(hasattr(model, attr) for attr in required_attrs)
+
+
+def ensure_zs_inputs(model, z_val, s_val, z_ref, s_ref, device):
+    """
+    确保传入模型的 z/s 始终是张量：
+    - 若模型无辅助头或推理未返回预测，则退化为全零张量；
+    - 对需要 z/s 的模型（带 first 的群模型）尤其重要。
+    """
+    requires_zs = hasattr(model, "first")
+
+    def _ensure_tensor(candidate, ref):
+        if candidate is not None:
+            return candidate.to(device)
+        if ref is not None:
+            return torch.zeros_like(ref)
+        if requires_zs:
+            raise RuntimeError("Model requires z/s inputs but no fallback is available")
+        return None
+
+    z_out = _ensure_tensor(z_val, z_ref)
+    s_out = _ensure_tensor(s_val, s_ref)
+    return z_out, s_out
+
+
 def infer_zs(model, x, z_thresh=0.5):
     """
     测试/验证不允许用标签时，先用模型的扰动感知支路得到 z^/s^。
-    注意：该函数依赖 PerturbAwareNet 的 _x_as_32ch / _perturb_reducer 与 z_head / s_head。
+    对于没有扰动辅助头的模型，返回 (None, None)。
     """
-    red = model._perturb_reducer(model._x_as_32ch(x))   # [B,64,1,1]
-    red = red.view(red.size(0), -1)                     # [B,64]
-    z_logit = model.z_head(red)
-    s_pred  = model.s_head(red)
+    if not _model_supports_perturb_heads(model):
+        return None, None
+
+    red_fn = getattr(model, "_x_as_32ch")
+    reducer = getattr(model, "_perturb_reducer")
+    z_head = getattr(model, "z_head")
+    s_head = getattr(model, "s_head")
+
+    red = reducer(red_fn(x))                # [B,64,1,1]
+    red = red.view(red.size(0), -1)         # [B,64]
+    z_logit = z_head(red)
+    s_pred  = s_head(red)
     z_prob  = torch.sigmoid(z_logit)
     z_hat   = (z_prob > z_thresh).float()
     return z_hat, s_pred
@@ -125,6 +161,16 @@ def compute_s_norm_stats(loader, device):
 
 
 # ============= 训练/评估（联合训练） =============
+def _unpack_model_outputs(output):
+    if isinstance(output, (tuple, list)):
+        logits = output[0] if len(output) > 0 else None
+        feat = output[1] if len(output) > 1 else None
+        z_logit = output[2] if len(output) > 2 else None
+        s_pred = output[3] if len(output) > 3 else None
+        return logits, feat, z_logit, s_pred
+    return output, None, None, None
+
+
 def train_one_epoch(model, optimizer, loader, device, cfg, epoch_idx, s_mu=None, s_std=None):
     model.train()
     ce = nn.CrossEntropyLoss()
@@ -136,6 +182,7 @@ def train_one_epoch(model, optimizer, loader, device, cfg, epoch_idx, s_mu=None,
 
     # s 回归 warmup：前 cfg.s_warmup_epochs 个 epoch 不参与 s 回归
     lambda_s_eff = 0.0 if (epoch_idx < cfg.s_warmup_epochs) else float(cfg.lambda_s)
+    has_perturb_heads = _model_supports_perturb_heads(model)
 
     for it, (x, y, z, s) in enumerate(loader):
         x = x.to(device, non_blocking=True)
@@ -146,29 +193,35 @@ def train_one_epoch(model, optimizer, loader, device, cfg, epoch_idx, s_mu=None,
         if cfg.use_gt_zs_train:
             z_cls, s_cls = z, s
         else:
-            z_cls, s_cls = infer_zs(model, x_mix, cfg.z_thresh)
+            z_pred, s_pred = infer_zs(model, x_mix, cfg.z_thresh)
+            z_cls, s_cls = ensure_zs_inputs(model, z_pred, s_pred, z, s, device=x_mix.device)
 
-        logits, _, _, _ = model(x_mix, z_cls, s_cls)
+        logits, _, _, _ = _unpack_model_outputs(model(x_mix, z_cls, s_cls))
         if y_b is not None:
             cls_loss = lam * ce(logits, y_a) + (1. - lam) * ce(logits, y_b)
         else:
             cls_loss = ce(logits, y)
 
         # 2) 扰动支路监督（不用mixup）
-        _, _, z_logit, s_pred = model(x, z, s)
-        loss_z = bce(z_logit, z) * float(cfg.lambda_z)
+        _, _, z_logit, s_pred = _unpack_model_outputs(model(x, z, s))
+        loss_z = torch.tensor(0.0, device=device)
+        if z_logit is not None and has_perturb_heads:
+            loss_z = bce(z_logit, z) * float(cfg.lambda_z)
 
         # —— 关键改动：对 s 做按维标准化再回归 —— #
-        m = (z > 0.5)  # 仅在 z=1 的位置监督 s
-        if lambda_s_eff > 0 and m.any():
-            if (s_mu is not None) and (s_std is not None):
-                # 广播到 [B,D]
-                s_pred_n = (s_pred - s_mu) / s_std
-                s_true_n = (s      - s_mu) / s_std
+        if s_pred is not None and has_perturb_heads:
+            m = (z > 0.5)  # 仅在 z=1 的位置监督 s
+            if lambda_s_eff > 0 and m.any():
+                if (s_mu is not None) and (s_std is not None):
+                    # 广播到 [B,D]
+                    s_pred_n = (s_pred - s_mu) / s_std
+                    s_true_n = (s      - s_mu) / s_std
+                else:
+                    # 兜底：未提供统计量时，直接用原尺度（不建议）
+                    s_pred_n, s_true_n = s_pred, s
+                loss_s = reg(s_pred_n[m], s_true_n[m]) * lambda_s_eff
             else:
-                # 兜底：未提供统计量时，直接用原尺度（不建议）
-                s_pred_n, s_true_n = s_pred, s
-            loss_s = reg(s_pred_n[m], s_true_n[m]) * lambda_s_eff
+                loss_s = torch.tensor(0.0, device=device)
         else:
             loss_s = torch.tensor(0.0, device=device)
 
@@ -200,11 +253,14 @@ def _forward_eval(model, batch, device, cfg):
     x, y, z, s = batch
     x = x.to(device, non_blocking=True)
     y = y.to(device)
+    z = z.to(device)
+    s = s.to(device)
     if cfg.use_gt_zs_eval:
-        z_use, s_use = z.to(device), s.to(device)
+        z_use, s_use = z, s
     else:
-        z_use, s_use = infer_zs(model, x, cfg.z_thresh)
-    logits, feat, _, _ = model(x, z_use, s_use)
+        z_pred, s_pred = infer_zs(model, x, cfg.z_thresh)
+        z_use, s_use = ensure_zs_inputs(model, z_pred, s_pred, z, s, device=device)
+    logits, feat, _, _ = _unpack_model_outputs(model(x, z_use, s_use))
     return logits, feat, y
 
 
@@ -282,6 +338,7 @@ def run(cfg, device):
     print("程序：PerturbAwareNet（联合训练：分类 + 扰动分类 + 扰动参数）")
     print(f"数据路径：{cfg.data}")
     print(f"保存目录：{cfg.save_root}")
+    print(f"模型：{cfg.model_name}")
     os.makedirs(cfg.save_root, exist_ok=True)
 
     # 1) 读取数据（严格匹配你生成的数据结构）
@@ -316,7 +373,7 @@ def run(cfg, device):
     summarize_zs(valloader,  tag="val")
 
     # 3) 模型
-    model = mymodel1.create(name='perturbawarenet', num_classes=cfg.class_num, fs=fs)
+    model = mymodel1.create(name=cfg.model_name, num_classes=cfg.class_num, fs=fs)
     model = model.to(device)
 
     # 类别权重（按训练集频次）
@@ -350,7 +407,7 @@ def run(cfg, device):
     print("训练耗时：", str(datetime.timedelta(seconds=int(elapsed))))
 
     # 保存最好模型
-    ckpt = osp.join(cfg.save_root, "perturbawarenet_best.pt")
+    ckpt = osp.join(cfg.save_root, f"{cfg.model_name}_best.pt")
     torch.save(best_state, ckpt); print("[CKPT] 保存：", ckpt)
 
     # 5) 评估与可视化
@@ -382,6 +439,7 @@ def main():
         data=r"E:\数据集\ADS-B_Train_-5dB.mat",
 
         save_root="./runs_perturbaware",
+        model_name='perturbawarenet',
         class_num=10,
         batch_size=256,
         workers=0,
