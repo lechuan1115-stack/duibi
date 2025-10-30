@@ -59,9 +59,46 @@ def _make_backbone() -> nn.Sequential:
 
 
 # ------------------------------
+# 扰动分支复用工具
+# ------------------------------
+class PerturbBranchMixin:
+    """提供共享的扰动感知分支实现。"""
+
+    _lift32_layer: nn.Module = None
+
+    @staticmethod
+    def _x_as_32ch(x: torch.Tensor) -> torch.Tensor:
+        """将输入升到 32 通道，供扰动分支使用（与原模型保持一致）。"""
+        if PerturbBranchMixin._lift32_layer is None:
+            PerturbBranchMixin._lift32_layer = nn.Sequential(
+                nn.Conv2d(2, 32, kernel_size=(1, 1), bias=False),
+                nn.BatchNorm2d(32),
+                nn.ReLU(inplace=True),
+            )
+        return PerturbBranchMixin._lift32_layer.to(x.device)(x)
+
+    def _init_perturb_branch(self):
+        self._perturb_reducer = nn.Sequential(
+            nn.Conv2d(32, 64, kernel_size=(1, 3), padding=(0, 1), bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d((1, 1))
+        )
+        self.z_head = nn.Linear(64, N_PERT)
+        self.s_head = nn.Linear(64, N_PERT)
+
+    def _forward_perturb_branch(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        red = self._perturb_reducer(self._x_as_32ch(x))
+        red = red.view(red.size(0), -1)
+        z_logit = self.z_head(red)
+        s_pred = self.s_head(red)
+        return z_logit, s_pred
+
+
+# ------------------------------
 # 单一模型：PerturbAwareNet
 # ------------------------------
-class PerturbAwareNet(nn.Module):
+class PerturbAwareNet(PerturbBranchMixin, nn.Module):
     """
     输入:
         x: [B, 2, 1, L]
@@ -90,14 +127,7 @@ class PerturbAwareNet(nn.Module):
 
         # 扰动感知头（联合训练）
         # 先压到一个较小的共享表征，再分出 z/s 两个分支
-        self._perturb_reducer = nn.Sequential(
-            nn.Conv2d(32, 64, kernel_size=(1, 3), padding=(0, 1), bias=False),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            nn.AdaptiveAvgPool2d((1, 1))
-        )
-        self.z_head = nn.Linear(64, N_PERT)  # 二分类 logits（可用 BCEWithLogitsLoss）
-        self.s_head = nn.Linear(64, N_PERT)  # 实数回归（可用 SmoothL1Loss/MSELoss）
+        self._init_perturb_branch()
 
     # —— 为了不改 CSR，保留这三个空接口（不做任何事）——
     def set_steer_disabled(self, flag: bool):  # 兼容旧调用；现在始终启用群
@@ -114,10 +144,7 @@ class PerturbAwareNet(nn.Module):
         with torch.no_grad():
             pass  # 显式说明不需要这里对 x 额外处理；直接从 first 的输入侧取特征
         # 直接用一个浅层卷积对 x 提取共享表征（不依赖 z/s）
-        red = self._perturb_reducer(self._x_as_32ch(x))  # [B,64,1,1]
-        red = red.view(red.size(0), -1)                  # [B,64]
-        z_logit = self.z_head(red)                       # [B,5]
-        s_pred  = self.s_head(red)                       # [B,5]
+        z_logit, s_pred = self._forward_perturb_branch(x)
 
         # 2) 核转向 + 主干分类
         x = self.first(x, z, s)          # 需要 z/s；测试若无标签，请先用 z_logit/s_pred 生成 ẑ/ŝ
@@ -127,20 +154,71 @@ class PerturbAwareNet(nn.Module):
         logits = self.classifier(x)
         return logits, feat, z_logit, s_pred
 
-    @staticmethod
-    def _x_as_32ch(x: torch.Tensor) -> torch.Tensor:
-        """
-        将 [B,2,1,L] 通过一个固定映射升到 32 通道，供扰动感知头使用。
-        这里用 1×1 卷积快速升维，不影响第一层的群等变逻辑。
-        """
-        if not hasattr(PerturbAwareNet, "_lift32"):
-            # 惰性创建：共享一个升维层（不参与第一层转向）
-            PerturbAwareNet._lift32 = nn.Sequential(
-                nn.Conv2d(2, 32, kernel_size=(1, 1), bias=False),
-                nn.BatchNorm2d(32),
-                nn.ReLU(inplace=True),
-            ).to(x.device)
-        return PerturbAwareNet._lift32(x)
+# ------------------------------
+# CNN + Transformer 结合模型
+# ------------------------------
+class CNNTransformerNet(PerturbBranchMixin, nn.Module):
+    """卷积特征抽取 + Transformer 序列建模的混合网络。"""
+
+    def __init__(self, n_classes: int, fs: float = 50e6, *, d_model: int = 256,
+                 nhead: int = 4, num_encoder_layers: int = 4,
+                 dim_feedforward: int = 512, dropout: float = 0.1):
+        super().__init__()
+        # 第一层：普通卷积，不依赖 z/s
+        self.first = nn.Sequential(
+            nn.Conv2d(2, 32, kernel_size=(1, 5), padding=(0, 2), bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+        )
+
+        # CNN 前端：沿用纯 CNN 主干的前 3 层，输出 256 维通道
+        backbone = _make_backbone()
+        self.cnn_stem = nn.Sequential(*list(backbone.children())[:3])
+        self._stem_channels = 256
+
+        # Transformer 编码器
+        self.channel_to_model = nn.Linear(self._stem_channels, d_model)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward,
+            dropout=dropout, batch_first=False
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_encoder_layers)
+
+        # 分类头
+        self.seq_pool = nn.AdaptiveAvgPool1d(1)
+        hidden_dim = max(d_model // 2, 1)
+        self.classifier = nn.Sequential(
+            nn.Linear(d_model, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.5),
+            nn.Linear(hidden_dim, n_classes),
+        )
+
+        # 扰动感知头保持与 PerturbAwareNet 一致
+        self._init_perturb_branch()
+
+    def forward(self, x: torch.Tensor, z: torch.Tensor = None, s: torch.Tensor = None
+                ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # 扰动分支：不依赖 z/s
+        z_logit, s_pred = self._forward_perturb_branch(x)
+
+        # 卷积前端
+        x = self.first(x)
+        x = self.cnn_stem(x)
+
+        b, c, _, l = x.shape
+        x = x.view(b, c, l)
+        x = x.permute(2, 0, 1).contiguous()  # [L, B, C]
+        x = self.channel_to_model(x)          # [L, B, d_model]
+
+        # Transformer 编码
+        x = self.transformer(x)               # [L, B, d_model]
+
+        # 聚合并分类
+        x = x.permute(1, 2, 0).contiguous()   # [B, d_model, L]
+        feat = self.seq_pool(x).squeeze(-1)   # [B, d_model]
+        logits = self.classifier(feat)
+        return logits, feat, z_logit, s_pred
 
 
 class PlainFirstLayerNet(nn.Module):
@@ -211,6 +289,8 @@ def create(name: str, num_classes: int, fs: float = 50e6, **kwargs) -> nn.Module
     key = (name or "").strip().lower()
     if key == "perturbawarenet":
         return PerturbAwareNet(n_classes=num_classes, fs=fs)
+    if key == "cnn_transformer":
+        return CNNTransformerNet(n_classes=num_classes, fs=fs, **kwargs)
     if key == "perturbawarenet_plain":
         return PlainFirstLayerNet(n_classes=num_classes, fs=fs)
     raise KeyError(f"Unsupported model name: {name}")
