@@ -19,7 +19,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from gconv import SteerableFirstLayer  # 与你的 gconv 文件保持一致
+from gconv import SteerableFirstLayer, PlainFirstLayer  # 与你的 gconv 文件保持一致
 
 PERTURB_ORDER = ['CFO', 'SCALE', 'GAIN', 'SHIFT', 'CHIRP']
 N_PERT = len(PERTURB_ORDER)
@@ -143,11 +143,74 @@ class PerturbAwareNet(nn.Module):
         return PerturbAwareNet._lift32(x)
 
 
+class PlainFirstLayerNet(nn.Module):
+    """结构与 PerturbAwareNet 相同，但第一层为普通卷积。"""
+
+    def __init__(self, n_classes: int, fs: float = 50e6):
+        super().__init__()
+        self.first = PlainFirstLayer(in_ch=2, out_ch=32, k=5, fs=fs)
+
+        self.features = _make_backbone()
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+
+        self.classifier = nn.Sequential(
+            nn.Linear(1024, 512), nn.ReLU(inplace=True), nn.Dropout(0.5),
+            nn.Linear(512, n_classes),
+        )
+
+        self._perturb_reducer = nn.Sequential(
+            nn.Conv2d(32, 64, kernel_size=(1, 3), padding=(0, 1), bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d((1, 1))
+        )
+        self.z_head = nn.Linear(64, N_PERT)
+        self.s_head = nn.Linear(64, N_PERT)
+
+    def set_steer_disabled(self, flag: bool):
+        return
+
+    def set_first_debug(self, flag: bool):
+        return
+
+    def get_first_last_debug(self):
+        return {}
+
+    def forward(self, x: torch.Tensor, z: torch.Tensor = None, s: torch.Tensor = None
+                ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        with torch.no_grad():
+            pass
+        red = self._perturb_reducer(self._x_as_32ch(x))
+        red = red.view(red.size(0), -1)
+        z_logit = self.z_head(red)
+        s_pred = self.s_head(red)
+
+        zeros = torch.zeros(x.size(0), N_PERT, device=x.device, dtype=x.dtype)
+        x = self.first(x, zeros, zeros)
+        x = self.features(x)
+        x = self.pool(x).view(x.size(0), -1)
+        feat = x
+        logits = self.classifier(x)
+        return logits, feat, z_logit, s_pred
+
+    @staticmethod
+    def _x_as_32ch(x: torch.Tensor) -> torch.Tensor:
+        if not hasattr(PlainFirstLayerNet, "_lift32"):
+            PlainFirstLayerNet._lift32 = nn.Sequential(
+                nn.Conv2d(2, 32, kernel_size=(1, 1), bias=False),
+                nn.BatchNorm2d(32),
+                nn.ReLU(inplace=True),
+            ).to(x.device)
+        return PlainFirstLayerNet._lift32(x)
+
+
 # ------------------------------
 # 工厂：只保留“perturbawarenet”一个名字
 # ------------------------------
-def create(name: str, num_classes: int, fs: float = 50e6, **kwargs) -> PerturbAwareNet:
+def create(name: str, num_classes: int, fs: float = 50e6, **kwargs) -> nn.Module:
     key = (name or "").strip().lower()
-    if key != "perturbawarenet":
-        raise KeyError(f"Only 'perturbawarenet' is supported, got: {name}")
-    return PerturbAwareNet(n_classes=num_classes, fs=fs)
+    if key == "perturbawarenet":
+        return PerturbAwareNet(n_classes=num_classes, fs=fs)
+    if key == "perturbawarenet_plain":
+        return PlainFirstLayerNet(n_classes=num_classes, fs=fs)
+    raise KeyError(f"Unsupported model name: {name}")
